@@ -1,10 +1,12 @@
 package net.kaaass.zerotierfix.service;
 
+import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.net.VpnService;
 import android.os.Binder;
 import android.os.Build;
@@ -259,6 +261,67 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         }
     }
 
+    private void ensureNotificationManager() {
+        if (this.notificationManager == null) {
+            this.notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && this.notificationManager != null) {
+            String channelName = getString(R.string.channel_name);
+            String description = getString(R.string.channel_description);
+            var channel = new NotificationChannel(
+                    Constants.CHANNEL_ID, channelName, NotificationManager.IMPORTANCE_HIGH);
+            channel.setDescription(description);
+            this.notificationManager.createNotificationChannel(channel);
+        }
+    }
+
+    private Notification buildStatusNotification(String title, String text) {
+        ensureNotificationManager();
+        int pendingIntentFlag = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            pendingIntentFlag |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        var pendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                new Intent(this, NetworkListActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                                | Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                pendingIntentFlag
+        );
+        return new NotificationCompat.Builder(this, Constants.CHANNEL_ID)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setOngoing(true)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setColor(ContextCompat.getColor(getApplicationContext(), R.color.zerotier_orange))
+                .setContentIntent(pendingIntent)
+                .build();
+    }
+
+    private void startForegroundCompat(Notification notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                    ZT_NOTIFICATION_TAG,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            );
+        } else {
+            startForeground(ZT_NOTIFICATION_TAG, notification);
+        }
+    }
+
+    private void showConnectedNotification(String networkIdString) {
+        var notification = buildStatusNotification(
+                getString(R.string.notification_title_connected),
+                getString(R.string.notification_text_connected, networkIdString)
+        );
+        if (this.notificationManager != null) {
+            this.notificationManager.notify(ZT_NOTIFICATION_TAG, notification);
+        }
+    }
+
     /**
      * 启动 ZT 服务，连接至给定网络或最近连接的网络
      */
@@ -266,10 +329,7 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
     public int onStartCommand(Intent intent, int flags, int startId) {
         long networkId;
         Log.d(TAG, "onStartCommand");
-        if (startId == 3) {
-            Log.i(TAG, "Authorizing VPN");
-            return START_NOT_STICKY;
-        } else if (intent == null) {
+        if (intent == null) {
             Log.e(TAG, "NULL intent.  Cannot start");
             return START_NOT_STICKY;
         }
@@ -316,6 +376,17 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
             return START_NOT_STICKY;
         }
         this.networkId = networkId;
+        // Android 14+ 要求 VPN 以特定类型前台服务运行
+        try {
+            var notification = buildStatusNotification(
+                    getString(R.string.app_name),
+                    getString(R.string.notification_text_connecting, Long.toHexString(networkId))
+            );
+            startForegroundCompat(notification);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start VPN foreground service", e);
+            return START_NOT_STICKY;
+        }
 
         // 检查当前的网络环境
         var preferences = PreferenceManager.getDefaultSharedPreferences(this);
@@ -486,6 +557,11 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         }
         if (this.eventBus.isRegistered(this)) {
             this.eventBus.unregister(this);
+        }
+        try {
+            stopForeground(true);
+        } catch (Exception e) {
+            Log.e(TAG, "Error stopping foreground service", e);
         }
         if (this.notificationManager != null) {
             this.notificationManager.cancel(ZT_NOTIFICATION_TAG);
@@ -737,7 +813,10 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
             switch (op) {
                 case VIRTUAL_NETWORK_CONFIG_OPERATION_UP:
                     Log.d(TAG, "Network Type: " + config.getType() + " Network Status: " + config.getStatus() + " Network Name: " + config.getName() + " ");
-                    // 将网络配置的更新交给第一次 Update
+                    // 部分设备/版本只会回调 UP，不会立即回调 CONFIG_UPDATE
+                    // 因此在 UP 阶段也要保存配置并触发隧道配置
+                    boolean isUpChanged = setVirtualNetworkConfigAndUpdateDatabase(network, config);
+                    this.eventBus.post(new NetworkReconfigureEvent(isUpChanged, network, config));
                     break;
                 case VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE:
                     Log.i(TAG, "Network Config Update!");
@@ -949,36 +1028,7 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         this.tunTapAdapter.startThreads();
 
         // 状态栏提示
-        if (this.notificationManager == null) {
-            this.notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        }
-        if (Build.VERSION.SDK_INT >= 26) {
-            String channelName = getString(R.string.channel_name);
-            String description = getString(R.string.channel_description);
-            var channel = new NotificationChannel(
-                    Constants.CHANNEL_ID, channelName, NotificationManager.IMPORTANCE_HIGH);
-            channel.setDescription(description);
-            this.notificationManager.createNotificationChannel(channel);
-        }
-        int pendingIntentFlag = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= 31) {
-            pendingIntentFlag |= PendingIntent.FLAG_IMMUTABLE;
-        }
-        var pendingIntent =
-                PendingIntent.getActivity(this, 0,
-                        new Intent(this, NetworkListActivity.class)
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP
-                                        | Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                        , pendingIntentFlag);
-        var notification = new NotificationCompat.Builder(this, Constants.CHANNEL_ID)
-                .setPriority(1)
-                .setOngoing(true)
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(getString(R.string.notification_title_connected))
-                .setContentText(getString(R.string.notification_text_connected, network.getNetworkIdStr()))
-                .setColor(ContextCompat.getColor(getApplicationContext(), R.color.zerotier_orange))
-                .setContentIntent(pendingIntent).build();
-        this.notificationManager.notify(ZT_NOTIFICATION_TAG, notification);
+        showConnectedNotification(network.getNetworkIdStr());
         Log.i(TAG, "ZeroTier One Connected");
 
         // 旧版本 Android 多播处理

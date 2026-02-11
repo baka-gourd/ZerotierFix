@@ -136,6 +136,7 @@
     <string name="channel_name">连接状态通知</string>
     <string name="channel_description">连接状态</string>
     <string name="notification_title_connected">已连接</string>
+    <string name="notification_text_connecting">正在连接至网络: %1$s</string>
     <string name="notification_text_connected">已连接至网络: %1$s</string>
     <string name="toast_vpn_application_not_prepared" >VPN 服务还未准备好或已经失效。</string>
     <string name="toast_network_status_ok">成功连接至网络 %1$s</string>
